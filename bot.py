@@ -17,10 +17,11 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL = "@niwzex"
 MAX_VERIFY_ATTEMPTS = 15
 
-NAME, AGE, MY_GENDER, ABOUT, CITY, GEO, RADIUS, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(10)
+NAME, AGE, MY_GENDER, ABOUT, CITY_OR_GEO, RADIUS, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(9)
 VERIFY_VIDEO = 100
 EDIT_CHOICE = 200
-EDIT_NAME, EDIT_AGE, EDIT_ABOUT, EDIT_CITY, EDIT_GEO, EDIT_RADIUS, EDIT_GENDER = range(201, 208)
+EDIT_NAME, EDIT_AGE, EDIT_ABOUT, EDIT_CITY, EDIT_RADIUS, EDIT_GENDER = range(201, 207)
+EDIT_PHOTO = 300
 
 conn = sqlite3.connect("dating.db", check_same_thread=False)
 cur = conn.cursor()
@@ -78,7 +79,7 @@ def edit_menu():
     return ReplyKeyboardMarkup([
         ["Имя", "Возраст"],
         ["Описание", "Фото"],
-        ["Город", "Гео"],
+        ["🏙 Город / Гео"],
         ["Радиус", "Пол"],
         ["🔙 Назад"]
     ], resize_keyboard=True)
@@ -209,22 +210,24 @@ async def get_my_gender(update, context):
 
 async def get_about(update, context):
     context.user_data["about"] = "" if update.message.text == "Пропустить" else update.message.text
-    await update.message.reply_text("Напиши свой город:")
-    return CITY
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Отправить гео", request_location=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await update.message.reply_text(
+        "Напиши свой город **или** отправь гео 📍\n\n(Если отправишь гео — город можно не писать)",
+        reply_markup=kb, parse_mode="Markdown"
+    )
+    return CITY_OR_GEO
 
 
-async def get_city(update, context):
-    context.user_data["city"] = update.message.text.strip()
-    await update.message.reply_text("Отправь гео (по желанию) или нажми «Пропустить».",
-        reply_markup=ReplyKeyboardMarkup([["Пропустить"]], resize_keyboard=True))
-    return GEO
-
-
-async def get_geo(update, context):
+async def get_city_or_geo(update, context):
     if update.message.location:
         context.user_data["lat"] = update.message.location.latitude
         context.user_data["lon"] = update.message.location.longitude
+        context.user_data["city"] = ""
     else:
+        context.user_data["city"] = update.message.text.strip()
         context.user_data["lat"] = None
         context.user_data["lon"] = None
     await update.message.reply_text("Радиус поиска в км (5–100):",
@@ -335,14 +338,16 @@ async def find(update, context):
     candidates = []
     for r in rows:
         uid, name, age, about, photos, gender, city, lat, lon = r
-        if city != my_city:
-            continue
         dist = None
+        match = False
         if my_lat and my_lon and lat and lon:
             dist = haversine(my_lat, my_lon, lat, lon)
-            if dist > my_radius:
-                continue
-        candidates.append((dist if dist is not None else 9999, uid, name, age, about, photos, gender, city, dist))
+            if dist <= my_radius:
+                match = True
+        elif my_city and city and my_city == city:
+            match = True
+        if match:
+            candidates.append((dist if dist is not None else 9999, uid, name, age, about, photos, gender, city, dist))
 
     if not candidates:
         await update.message.reply_text("В твоём городе/радиусе пока никого нет 😔")
@@ -353,7 +358,12 @@ async def find(update, context):
     cur.execute("UPDATE users SET last_shown = ? WHERE user_id = ?", (uid, user_id))
     conn.commit()
     badge = " ⭐" if is_premium(uid) else ""
-    dist_text = f"\n📍 {round(real_dist, 1)} км" if real_dist is not None else f"\n🏙 {city}"
+    if real_dist is not None:
+        dist_text = f"\n📍 {round(real_dist, 1)} км"
+    elif city:
+        dist_text = f"\n🏙 {city}"
+    else:
+        dist_text = ""
     text = f"👤 {name}, {age} ({gender}){badge}{dist_text}\n\n{about or '—'}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{uid}"),
@@ -442,19 +452,24 @@ async def like_handler(update, context):
 # ---------- Моя анкета ----------
 async def my_profile(update, context):
     user_id = update.effective_user.id
-    cur.execute("""SELECT name, age, my_gender, about, photos, verified, city, radius
+    cur.execute("""SELECT name, age, my_gender, about, photos, verified, city, radius, lat, lon
                    FROM users WHERE user_id = ?""", (user_id,))
     row = cur.fetchone()
     if not row:
         await update.message.reply_text("Анкеты нет. /start")
         return
-    name, age, gender, about, photos, verified, city, radius = row
+    name, age, gender, about, photos, verified, city, radius, lat, lon = row
     status = []
     if verified:
         status.append("✅")
     if is_premium(user_id):
         status.append("⭐")
-    text = f"👤 {name}, {age} ({gender}) {' '.join(status)}\n🏙 {city} · 📍 {radius} км\n\n{about or '—'}"
+    loc = ""
+    if lat and lon:
+        loc = "📍 по гео"
+    elif city:
+        loc = f"🏙 {city}"
+    text = f"👤 {name}, {age} ({gender}) {' '.join(status)}\n{loc} · 📏 {radius} км\n\n{about or '—'}"
     photos_list = photos.split(",") if photos else []
     if photos_list:
         for i, fid in enumerate(photos_list):
@@ -488,13 +503,14 @@ async def edit_choice(update, context):
     if t == "Фото":
         await update.message.reply_text("Отправь новые фото (старые заменятся)")
         context.user_data["edit_photos"] = []
-        return "EDIT_PHOTO"
-    if t == "Город":
-        await update.message.reply_text("Новый город:")
+        return EDIT_PHOTO
+    if t == "🏙 Город / Гео":
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("📍 Отправить гео", request_location=True)], ["🔙 Назад"]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await update.message.reply_text("Напиши город или отправь гео 📍", reply_markup=kb)
         return EDIT_CITY
-    if t == "Гео":
-        await update.message.reply_text("Отправь гео:")
-        return EDIT_GEO
     if t == "Радиус":
         await update.message.reply_text("Новый радиус (5–100):",
             reply_markup=ReplyKeyboardMarkup([["5", "10", "25"], ["50", "75", "100"]], resize_keyboard=True))
@@ -534,21 +550,16 @@ async def save_about(update, context):
     return ConversationHandler.END
 
 
-async def save_city(update, context):
-    cur.execute("UPDATE users SET city = ? WHERE user_id = ?", (update.message.text.strip(), update.effective_user.id))
+async def save_city_or_geo(update, context):
+    if update.message.location:
+        cur.execute("UPDATE users SET lat = ?, lon = ?, city = '' WHERE user_id = ?",
+                    (update.message.location.latitude, update.message.location.longitude,
+                     update.effective_user.id))
+    else:
+        cur.execute("UPDATE users SET city = ?, lat = NULL, lon = NULL WHERE user_id = ?",
+                    (update.message.text.strip(), update.effective_user.id))
     conn.commit()
-    await update.message.reply_text("✅ Город изменён", reply_markup=main_menu())
-    return ConversationHandler.END
-
-
-async def save_geo(update, context):
-    if not update.message.location:
-        await update.message.reply_text("Нужна геолокация")
-        return EDIT_GEO
-    cur.execute("UPDATE users SET lat = ?, lon = ? WHERE user_id = ?",
-                (update.message.location.latitude, update.message.location.longitude, update.effective_user.id))
-    conn.commit()
-    await update.message.reply_text("✅ Гео обновлено", reply_markup=main_menu())
+    await update.message.reply_text("✅ Обновлено", reply_markup=main_menu())
     return ConversationHandler.END
 
 
@@ -586,7 +597,7 @@ async def save_edit_photo(update, context):
         photos.append(update.message.video.file_id)
     else:
         await update.message.reply_text("Нужно фото/видео")
-        return "EDIT_PHOTO"
+        return EDIT_PHOTO
     context.user_data["edit_photos"] = photos
     if len(photos) >= limit:
         cur.execute("UPDATE users SET photos = ? WHERE user_id = ?",
@@ -596,7 +607,7 @@ async def save_edit_photo(update, context):
         return ConversationHandler.END
     await update.message.reply_text(f"({len(photos)}/{limit}) Ещё или Готово?",
         reply_markup=ReplyKeyboardMarkup([["Добавить ещё", "Готово"]], resize_keyboard=True))
-    return "EDIT_PHOTO"
+    return EDIT_PHOTO
 
 
 async def edit_photo_done(update, context):
@@ -608,7 +619,7 @@ async def edit_photo_done(update, context):
         await update.message.reply_text("✅ Фото обновлены", reply_markup=main_menu())
         return ConversationHandler.END
     await update.message.reply_text("Отправь ещё фото")
-    return "EDIT_PHOTO"
+    return EDIT_PHOTO
 
 
 # ---------- Остальное ----------
@@ -871,8 +882,10 @@ def main():
             AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_age)],
             MY_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_my_gender)],
             ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_about)],
-            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_city)],
-            GEO: [MessageHandler(filters.LOCATION, get_geo), MessageHandler(filters.Regex("^Пропустить$"), get_geo)],
+            CITY_OR_GEO: [
+                MessageHandler(filters.LOCATION, get_city_or_geo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, get_city_or_geo)
+            ],
             RADIUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_radius)],
             PHOTO: [MessageHandler(filters.PHOTO | filters.VIDEO, get_photo),
                     MessageHandler(filters.Regex("^(Добавить ещё|Готово)$"), photo_choice)],
@@ -883,12 +896,14 @@ def main():
             EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
             EDIT_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_age)],
             EDIT_ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_about)],
-            EDIT_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_city)],
-            EDIT_GEO: [MessageHandler(filters.LOCATION, save_geo)],
+            EDIT_CITY: [
+                MessageHandler(filters.LOCATION, save_city_or_geo),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, save_city_or_geo)
+            ],
             EDIT_RADIUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_radius)],
             EDIT_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_gender)],
-            "EDIT_PHOTO": [MessageHandler(filters.PHOTO | filters.VIDEO, save_edit_photo),
-                           MessageHandler(filters.Regex("^(Добавить ещё|Готово)$"), edit_photo_done)],
+            EDIT_PHOTO: [MessageHandler(filters.PHOTO | filters.VIDEO, save_edit_photo),
+                         MessageHandler(filters.Regex("^(Добавить ещё|Готово)$"), edit_photo_done)],
         },
         fallbacks=[MessageHandler(filters.Regex("^🔙 В меню$"), back_to_menu)]
     )
