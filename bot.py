@@ -2,9 +2,10 @@ import os
 import sqlite3
 import datetime
 import random
+import math
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, LabeledPrice
+    ReplyKeyboardMarkup, LabeledPrice, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -16,7 +17,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL = "@niwzex"
 MAX_VERIFY_ATTEMPTS = 15
 
-NAME, AGE, MY_GENDER, ABOUT, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(7)
+NAME, AGE, MY_GENDER, ABOUT, CITY, GEO, RADIUS, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(10)
 VERIFY_VIDEO = 100
 
 conn = sqlite3.connect("dating.db", check_same_thread=False)
@@ -29,6 +30,10 @@ cur.execute("""CREATE TABLE IF NOT EXISTS users (
     age INTEGER,
     my_gender TEXT,
     about TEXT,
+    city TEXT,
+    lat REAL,
+    lon REAL,
+    radius INTEGER DEFAULT 50,
     photos TEXT,
     partner_gender TEXT,
     partner_age_min INTEGER,
@@ -40,7 +45,8 @@ cur.execute("""CREATE TABLE IF NOT EXISTS users (
     verify_attempts INTEGER DEFAULT 0,
     super_likes_today INTEGER DEFAULT 0,
     last_shown INTEGER DEFAULT 0,
-    hidden INTEGER DEFAULT 0
+    hidden INTEGER DEFAULT 0,
+    last_active TEXT
 )""")
 cur.execute("""CREATE TABLE IF NOT EXISTS likes (
     from_id INTEGER, to_id INTEGER, valentine INTEGER DEFAULT 0, super INTEGER DEFAULT 0
@@ -55,13 +61,22 @@ def today():
     return datetime.date.today().isoformat()
 
 
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+
 def main_menu():
     return ReplyKeyboardMarkup([
         ["👀 Искать", "💗 Лайки"],
         ["💖 Мэтчи", "💌 Валентинки"],
         ["👁 Кто лайкнул", "✏️ Моя анкета"],
         ["⭐ Premium", "✅ Верификация"],
-        ["↩️ Вернуть анкету", "🗑 Удалить анкету"]
+        ["📍 Радиус поиска", "↩️ Вернуть анкету"],
+        ["🗑 Удалить анкету"]
     ], resize_keyboard=True)
 
 
@@ -149,6 +164,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     if cur.fetchone():
+        cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (today(), user_id))
+        conn.commit()
         await update.message.reply_text("Ты уже зарегистрирован(а) 💕", reply_markup=main_menu())
         return ConversationHandler.END
     await update.message.reply_text("Привет! Давай создадим анкету 💕\n\nКак тебя зовут?")
@@ -187,6 +204,47 @@ async def get_my_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["about"] = "" if update.message.text == "Пропустить" else update.message.text
+    await update.message.reply_text("Напиши свой город:")
+    return CITY
+
+
+async def get_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["city"] = update.message.text.strip()
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("📍 Отправить гео", request_location=True)]],
+        resize_keyboard=True, one_time_keyboard=True
+    )
+    await update.message.reply_text(
+        "Отправь свою геолокацию (по желанию) — так тебя увидят те, кто ближе.\n"
+        "Или нажми «Пропустить».",
+        reply_markup=ReplyKeyboardMarkup([["Пропустить"]], resize_keyboard=True)
+    )
+    return GEO
+
+
+async def get_geo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.location:
+        context.user_data["lat"] = update.message.location.latitude
+        context.user_data["lon"] = update.message.location.longitude
+    else:
+        context.user_data["lat"] = None
+        context.user_data["lon"] = None
+    await update.message.reply_text(
+        "Радиус поиска в км (5–100). Напиши число:",
+        reply_markup=ReplyKeyboardMarkup([["5", "10", "25"], ["50", "75", "100"]], resize_keyboard=True)
+    )
+    return RADIUS
+
+
+async def get_radius(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        r = int(update.message.text)
+        if r < 5 or r > 100:
+            raise ValueError
+    except:
+        await update.message.reply_text("Число от 5 до 100")
+        return RADIUS
+    context.user_data["radius"] = r
     context.user_data["photos"] = []
     limit = get_photo_limit(update.effective_user.id)
     await update.message.reply_text(f"Отправь фото или видео (от 1 до {limit})")
@@ -239,15 +297,18 @@ async def get_partner_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PARTNER_AGE
     user = update.effective_user
     cur.execute("""INSERT OR REPLACE INTO users
-        (user_id, username, name, age, my_gender, about, photos, partner_gender,
-         partner_age_min, partner_age_max, verified, premium_until, likes_today,
-         likes_date, verify_attempts, super_likes_today, last_shown, hidden)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+        (user_id, username, name, age, my_gender, about, city, lat, lon, radius,
+         photos, partner_gender, partner_age_min, partner_age_max, verified,
+         premium_until, likes_today, likes_date, verify_attempts, super_likes_today,
+         last_shown, hidden, last_active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
         user.id, user.username or "", context.user_data["name"], context.user_data["age"],
         context.user_data["my_gender"], context.user_data["about"],
+        context.user_data["city"], context.user_data.get("lat"), context.user_data.get("lon"),
+        context.user_data["radius"],
         ",".join(context.user_data["photos"]),
         context.user_data["partner_gender"], amin, amax,
-        0, None, 0, today(), 0, 0, 0, 0
+        0, None, 0, today(), 0, 0, 0, 0, today()
     ))
     conn.commit()
     await update.message.reply_text("Анкета готова! 💕", reply_markup=main_menu())
@@ -256,24 +317,47 @@ async def get_partner_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (today(), user_id))
+    conn.commit()
     if not check_like_limit(user_id):
         await update.message.reply_text("Лимит лайков исчерпан.\n✅ Верификация — 500/день\n⭐ Premium — безлимит")
         return
-    cur.execute("""SELECT user_id, name, age, about, photos, my_gender FROM users
-                   WHERE user_id != ? AND user_id != ? AND user_id NOT IN
-                   (SELECT to_id FROM likes WHERE from_id = ?)
-                   ORDER BY (premium_until IS NOT NULL AND premium_until >= ?) DESC, RANDOM()
-                   LIMIT 1""", (user_id, ADMIN_ID, user_id, today()))
-    row = cur.fetchone()
-    if not row:
+    cur.execute("SELECT city, lat, lon, radius FROM users WHERE user_id = ?", (user_id,))
+    me = cur.fetchone()
+    my_city, my_lat, my_lon, my_radius = me if me else (None, None, None, 50)
+
+    cur.execute("""SELECT user_id, name, age, about, photos, my_gender, city, lat, lon
+                   FROM users WHERE user_id != ? AND user_id != ?
+                   AND user_id NOT IN (SELECT to_id FROM likes WHERE from_id = ?)""",
+                (user_id, ADMIN_ID, user_id))
+    rows = cur.fetchall()
+    if not rows:
         await update.message.reply_text("Анкеты закончились 😔")
         return
-    uid, name, age, about, photos, gender = row
+
+    candidates = []
+    for r in rows:
+        uid, name, age, about, photos, gender, city, lat, lon = r
+        if city != my_city:
+            continue
+        dist = None
+        if my_lat and my_lon and lat and lon:
+            dist = haversine(my_lat, my_lon, lat, lon)
+            if dist > my_radius:
+                continue
+        candidates.append((dist if dist is not None else 9999, uid, name, age, about, photos, gender, city, dist))
+
+    if not candidates:
+        await update.message.reply_text("В твоём городе/радиусе пока никого нет 😔")
+        return
+
+    candidates.sort(key=lambda x: x[0])
+    dist, uid, name, age, about, photos, gender, city, real_dist = candidates[0]
     cur.execute("UPDATE users SET last_shown = ? WHERE user_id = ?", (uid, user_id))
     conn.commit()
-    is_prem = is_premium(uid)
-    badge = " ⭐" if is_prem else ""
-    text = f"👤 {name}, {age} ({gender}){badge}\n\n{about or '—'}"
+    badge = " ⭐" if is_premium(uid) else ""
+    dist_text = f"\n📍 {round(real_dist, 1)} км" if real_dist is not None else f"\n🏙 {city}"
+    text = f"👤 {name}, {age} ({gender}){badge}{dist_text}\n\n{about or '—'}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{uid}"),
          InlineKeyboardButton("💌 Валентинка", callback_data=f"val_{uid}")],
@@ -306,7 +390,10 @@ async def like_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "skip":
-        await q.edit_message_caption("Пропущено 👎")
+        try:
+            await q.edit_message_caption("Пропущено 👎")
+        except:
+            await q.edit_message_text("Пропущено 👎")
         return
 
     if data.startswith("report_"):
@@ -357,19 +444,19 @@ async def like_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    cur.execute("""SELECT name, age, my_gender, about, photos, verified, premium_until
+    cur.execute("""SELECT name, age, my_gender, about, photos, verified, city, radius
                    FROM users WHERE user_id = ?""", (user_id,))
     row = cur.fetchone()
     if not row:
         await update.message.reply_text("Анкеты нет. /start")
         return
-    name, age, gender, about, photos, verified, premium = row
+    name, age, gender, about, photos, verified, city, radius = row
     status = []
     if verified:
-        status.append("✅ Верифицирован")
+        status.append("✅")
     if is_premium(user_id):
-        status.append("⭐ Premium")
-    text = f"👤 {name}, {age} ({gender})\n\n{about or '—'}\n\n" + " · ".join(status)
+        status.append("⭐")
+    text = f"👤 {name}, {age} ({gender}) {' '.join(status)}\n🏙 {city} · 📍 {radius} км\n\n{about or '—'}"
     photos_list = photos.split(",") if photos else []
     if photos_list:
         for i, fid in enumerate(photos_list):
@@ -423,6 +510,26 @@ async def my_valentines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cur.fetchall()
     text = "\n".join([f"{n} — @{u or 'скрыт'}" for n, u in rows]) if rows else "Пусто"
     await update.message.reply_text("💌 Валентинки:\n" + text)
+
+
+async def change_radius(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Выбери новый радиус (км):",
+        reply_markup=ReplyKeyboardMarkup([["5", "10", "25"], ["50", "75", "100"]], resize_keyboard=True))
+    return RADIUS + 1000
+
+
+async def set_radius(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        r = int(update.message.text)
+        if r < 5 or r > 100:
+            raise ValueError
+    except:
+        await update.message.reply_text("Число от 5 до 100")
+        return RADIUS + 1000
+    cur.execute("UPDATE users SET radius = ? WHERE user_id = ?", (r, update.effective_user.id))
+    conn.commit()
+    await update.message.reply_text(f"✅ Радиус изменён на {r} км", reply_markup=main_menu())
+    return ConversationHandler.END
 
 
 async def back_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -540,6 +647,75 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    cur.execute("SELECT COUNT(*) FROM users")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE verified = 1")
+    ver = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE premium_until IS NOT NULL AND premium_until >= ?", (today(),))
+    prem = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM likes")
+    likes = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM likes WHERE valentine = 1")
+    vals = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM likes WHERE super = 1")
+    supers = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM reports")
+    reps = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM users WHERE last_active = ?", (today(),))
+    active = cur.fetchone()[0]
+    text = (
+        f"📊 Статистика Тинк\n\n"
+        f"👥 Всего: {total}\n"
+        f"✅ Верифицированных: {ver}\n"
+        f"⭐ Premium: {prem}\n"
+        f"🟢 Активных сегодня: {active}\n\n"
+        f"❤️ Лайков: {likes}\n"
+        f"💌 Валентинок: {vals}\n"
+        f"⭐ Супер-лайков: {supers}\n"
+        f"🚨 Жалоб: {reps}"
+    )
+    await update.message.reply_text(text)
+
+
+async def grant_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(context.args[0])
+        days = int(context.args[1])
+    except:
+        await update.message.reply_text("Использование: /grant_premium USER_ID ДНИ")
+        return
+    cur.execute("SELECT user_id FROM users WHERE user_id = ?", (uid,))
+    if not cur.fetchone():
+        await update.message.reply_text("Такого пользователя нет в базе")
+        return
+    until = (datetime.date.today() + datetime.timedelta(days=days)).isoformat()
+    cur.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (until, uid))
+    conn.commit()
+    await update.message.reply_text(f"⭐ {uid} получил Premium до {until}")
+    try:
+        await context.bot.send_message(uid, f"⭐ Тебе выдан Premium до {until}!")
+    except:
+        pass
+
+
+async def revoke_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        uid = int(context.args[0])
+    except:
+        await update.message.reply_text("Использование: /revoke_premium USER_ID")
+        return
+    cur.execute("UPDATE users SET premium_until = NULL WHERE user_id = ?", (uid,))
+    conn.commit()
+    await update.message.reply_text(f"❌ Premium у {uid} забран")
+
+
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_premium(update.effective_user.id):
         if update.effective_user.id == ADMIN_ID:
@@ -566,78 +742,4 @@ async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def buy_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await context.bot.send_invoice(
-        chat_id=q.from_user.id,
-        title="Premium на 3 дня",
-        description="Супер-лайки, безлимит, до 6 фото и другие плюшки",
-        payload="premium_3d",
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice("Premium 3 дня", 20)]
-    )
-
-
-async def precheckout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    until = (datetime.date.today() + datetime.timedelta(days=3)).isoformat()
-    cur.execute("UPDATE users SET premium_until = ? WHERE user_id = ?", (until, uid))
-    conn.commit()
-    await update.message.reply_text("⭐ Premium активирован до " + until)
-
-
-async def delete_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    cur.execute("DELETE FROM users WHERE user_id = ?", (uid,))
-    cur.execute("DELETE FROM likes WHERE from_id = ? OR to_id = ?", (uid, uid))
-    conn.commit()
-    await update.message.reply_text("Анкета удалена 🗑 Напиши /start чтобы создать заново.")
-
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
-            AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_age)],
-            MY_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_my_gender)],
-            ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_about)],
-            PHOTO: [
-                MessageHandler(filters.PHOTO | filters.VIDEO, get_photo),
-                MessageHandler(filters.Regex("^(Добавить ещё|Готово)$"), photo_choice)
-            ],
-            PARTNER_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_partner_gender)],
-            PARTNER_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_partner_age)],
-            VERIFY_VIDEO: [MessageHandler(filters.VIDEO_NOTE, verify_video)],
-        },
-        fallbacks=[]
-    )
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("approve", approve))
-    app.add_handler(CommandHandler("reject", reject))
-    app.add_handler(MessageHandler(filters.Regex("^👀 Искать$"), find))
-    app.add_handler(MessageHandler(filters.Regex("^💗 Лайки$"), my_likes))
-    app.add_handler(MessageHandler(filters.Regex("^💖 Мэтчи$"), my_matches))
-    app.add_handler(MessageHandler(filters.Regex("^💌 Валентинки$"), my_valentines))
-    app.add_handler(MessageHandler(filters.Regex("^👁 Кто лайкнул$"), who_liked))
-    app.add_handler(MessageHandler(filters.Regex("^✏️ Моя анкета$"), my_profile))
-    app.add_handler(MessageHandler(filters.Regex("^⭐ Premium$"), premium))
-    app.add_handler(MessageHandler(filters.Regex("^✅ Верификация$"), verify_start))
-    app.add_handler(MessageHandler(filters.Regex("^↩️ Вернуть анкету$"), back_anketa))
-    app.add_handler(MessageHandler(filters.Regex("^🗑 Удалить анкету$"), delete_profile))
-    app.add_handler(CallbackQueryHandler(like_handler))
-    app.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_premium$"))
-    app.add_handler(PreCheckoutQueryHandler(precheckout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+async def buy_premium(update: Update, context: Context
