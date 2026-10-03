@@ -37,10 +37,13 @@ cur.execute("""CREATE TABLE IF NOT EXISTS users (
     premium_until TEXT,
     likes_today INTEGER DEFAULT 0,
     likes_date TEXT,
-    verify_attempts INTEGER DEFAULT 0
+    verify_attempts INTEGER DEFAULT 0,
+    super_likes_today INTEGER DEFAULT 0,
+    last_shown INTEGER DEFAULT 0,
+    hidden INTEGER DEFAULT 0
 )""")
 cur.execute("""CREATE TABLE IF NOT EXISTS likes (
-    from_id INTEGER, to_id INTEGER, valentine INTEGER DEFAULT 0
+    from_id INTEGER, to_id INTEGER, valentine INTEGER DEFAULT 0, super INTEGER DEFAULT 0
 )""")
 cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     from_id INTEGER, to_id INTEGER, reason TEXT, date TEXT
@@ -56,12 +59,15 @@ def main_menu():
     return ReplyKeyboardMarkup([
         ["👀 Искать", "💗 Лайки"],
         ["💖 Мэтчи", "💌 Валентинки"],
-        ["✏️ Моя анкета", "⭐ Premium"],
-        ["✅ Верификация", "🗑 Удалить анкету"]
+        ["👁 Кто лайкнул", "✏️ Моя анкета"],
+        ["⭐ Premium", "✅ Верификация"],
+        ["↩️ Вернуть анкету", "🗑 Удалить анкету"]
     ], resize_keyboard=True)
 
 
 def is_premium(user_id):
+    if user_id == ADMIN_ID:
+        return True
     cur.execute("SELECT premium_until FROM users WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
     if not row or not row[0]:
@@ -70,6 +76,10 @@ def is_premium(user_id):
         return datetime.date.fromisoformat(row[0]) >= datetime.date.today()
     except:
         return False
+
+
+def get_photo_limit(user_id):
+    return 6 if is_premium(user_id) else 3
 
 
 def check_like_limit(user_id):
@@ -82,6 +92,10 @@ def check_like_limit(user_id):
         cur.execute("UPDATE users SET likes_today = 0, likes_date = ? WHERE user_id = ?", (today(), user_id))
         conn.commit()
         likes_today = 0
+    if is_premium(user_id):
+        cur.execute("UPDATE users SET likes_today = likes_today + 1 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        return True
     limit = 500 if verified else 100
     if likes_today >= limit:
         return False
@@ -90,8 +104,29 @@ def check_like_limit(user_id):
     return True
 
 
+def check_super_limit(user_id):
+    if not is_premium(user_id):
+        return False
+    cur.execute("SELECT super_likes_today, likes_date FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row:
+        return False
+    super_today, likes_date = row
+    if likes_date != today():
+        cur.execute("UPDATE users SET super_likes_today = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        super_today = 0
+    if super_today >= 5:
+        return False
+    cur.execute("UPDATE users SET super_likes_today = super_likes_today + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    return True
+
+
 async def check_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id == ADMIN_ID:
+        return True
     try:
         member = await context.bot.get_chat_member(CHANNEL, user_id)
         return member.status in ["member", "administrator", "creator"]
@@ -153,12 +188,14 @@ async def get_my_gender(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["about"] = "" if update.message.text == "Пропустить" else update.message.text
     context.user_data["photos"] = []
-    await update.message.reply_text("Отправь фото или видео (от 1 до 3)")
+    limit = get_photo_limit(update.effective_user.id)
+    await update.message.reply_text(f"Отправь фото или видео (от 1 до {limit})")
     return PHOTO
 
 
 async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     photos = context.user_data.get("photos", [])
+    limit = get_photo_limit(update.effective_user.id)
     if update.message.photo:
         photos.append(update.message.photo[-1].file_id)
     elif update.message.video:
@@ -167,11 +204,11 @@ async def get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Это не фото и не видео. Попробуй ещё:")
         return PHOTO
     context.user_data["photos"] = photos
-    if len(photos) >= 3:
-        await update.message.reply_text("Максимум 3. Пол партнёра:",
+    if len(photos) >= limit:
+        await update.message.reply_text(f"Максимум {limit}. Пол партнёра:",
             reply_markup=ReplyKeyboardMarkup([["М", "Ж", "Всё равно"]], resize_keyboard=True))
         return PARTNER_GENDER
-    await update.message.reply_text(f"Добавлено ({len(photos)}/3). Добавить ещё или Готово?",
+    await update.message.reply_text(f"Добавлено ({len(photos)}/{limit}). Добавить ещё или Готово?",
         reply_markup=ReplyKeyboardMarkup([["Добавить ещё", "Готово"]], resize_keyboard=True))
     return PHOTO
 
@@ -201,12 +238,16 @@ async def get_partner_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Формат: 15-25 (от 15 до 99)")
         return PARTNER_AGE
     user = update.effective_user
-    cur.execute("INSERT OR REPLACE INTO users VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+    cur.execute("""INSERT OR REPLACE INTO users
+        (user_id, username, name, age, my_gender, about, photos, partner_gender,
+         partner_age_min, partner_age_max, verified, premium_until, likes_today,
+         likes_date, verify_attempts, super_likes_today, last_shown, hidden)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
         user.id, user.username or "", context.user_data["name"], context.user_data["age"],
         context.user_data["my_gender"], context.user_data["about"],
         ",".join(context.user_data["photos"]),
         context.user_data["partner_gender"], amin, amax,
-        0, None, 0, today(), 0
+        0, None, 0, today(), 0, 0, 0, 0
     ))
     conn.commit()
     await update.message.reply_text("Анкета готова! 💕", reply_markup=main_menu())
@@ -216,20 +257,27 @@ async def get_partner_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not check_like_limit(user_id):
-        await update.message.reply_text("Лимит лайков исчерпан.\n✅ Верификация — 500/день\n⭐ Premium — больше возможностей")
+        await update.message.reply_text("Лимит лайков исчерпан.\n✅ Верификация — 500/день\n⭐ Premium — безлимит")
         return
     cur.execute("""SELECT user_id, name, age, about, photos, my_gender FROM users
-                   WHERE user_id != ? AND user_id NOT IN
-                   (SELECT to_id FROM likes WHERE from_id = ?) LIMIT 1""", (user_id, user_id))
+                   WHERE user_id != ? AND user_id != ? AND user_id NOT IN
+                   (SELECT to_id FROM likes WHERE from_id = ?)
+                   ORDER BY (premium_until IS NOT NULL AND premium_until >= ?) DESC, RANDOM()
+                   LIMIT 1""", (user_id, ADMIN_ID, user_id, today()))
     row = cur.fetchone()
     if not row:
         await update.message.reply_text("Анкеты закончились 😔")
         return
     uid, name, age, about, photos, gender = row
-    text = f"👤 {name}, {age} ({gender})\n\n{about or '—'}"
+    cur.execute("UPDATE users SET last_shown = ? WHERE user_id = ?", (uid, user_id))
+    conn.commit()
+    is_prem = is_premium(uid)
+    badge = " ⭐" if is_prem else ""
+    text = f"👤 {name}, {age} ({gender}){badge}\n\n{about or '—'}"
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{uid}"),
          InlineKeyboardButton("💌 Валентинка", callback_data=f"val_{uid}")],
+        [InlineKeyboardButton("⭐ Супер-лайк", callback_data=f"super_{uid}")],
         [InlineKeyboardButton("👎 Пропустить", callback_data="skip"),
          InlineKeyboardButton("🚨 Жалоба", callback_data=f"report_{uid}")]
     ])
@@ -273,10 +321,30 @@ async def like_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
+    if data.startswith("super_"):
+        if not check_super_limit(me):
+            await q.answer("Супер-лайк доступен только с Premium (5/день)", show_alert=True)
+            return
+        target = int(data.split("_")[1])
+        cur.execute("INSERT INTO likes VALUES (?, ?, 0, 1)", (me, target))
+        conn.commit()
+        cur.execute("SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?", (target, me))
+        if cur.fetchone():
+            cur.execute("SELECT username FROM users WHERE user_id = ?", (target,))
+            uname = cur.fetchone()[0]
+            await q.edit_message_caption(f"⭐ Супер-лайк! 💖 Мэтч! @{uname or 'скрыт'}")
+            try:
+                await context.bot.send_message(target, "⭐ Тебя супер-лайкнули! Загляни в бота.")
+            except:
+                pass
+        else:
+            await q.edit_message_caption("⭐ Супер-лайк отправлен!")
+        return
+
     if data.startswith("like_") or data.startswith("val_"):
         target = int(data.split("_")[1])
         val = 1 if data.startswith("val_") else 0
-        cur.execute("INSERT INTO likes VALUES (?, ?, ?)", (me, target, val))
+        cur.execute("INSERT INTO likes VALUES (?, ?, ?, 0)", (me, target, val))
         conn.commit()
         cur.execute("SELECT 1 FROM likes WHERE from_id = ? AND to_id = ?", (target, me))
         if cur.fetchone():
@@ -299,7 +367,7 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = []
     if verified:
         status.append("✅ Верифицирован")
-    if premium and is_premium(user_id):
+    if is_premium(user_id):
         status.append("⭐ Premium")
     text = f"👤 {name}, {age} ({gender})\n\n{about or '—'}\n\n" + " · ".join(status)
     photos_list = photos.split(",") if photos else []
@@ -311,6 +379,21 @@ async def my_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_photo(fid)
     else:
         await update.message.reply_text(text)
+
+
+async def who_liked(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    cur.execute("""SELECT u.name, u.username, l.valentine, l.super FROM likes l
+                   JOIN users u ON u.user_id = l.from_id WHERE l.to_id = ?""", (user_id,))
+    rows = cur.fetchall()
+    if not rows:
+        await update.message.reply_text("Тебя пока никто не лайкнул")
+        return
+    lines = []
+    for n, u, v, s in rows:
+        mark = "💌" if v else ("⭐" if s else "❤️")
+        lines.append(f"{mark} {n} — @{u or 'скрыт'}")
+    await update.message.reply_text("👁 Кто тебя лайкнул:\n" + "\n".join(lines))
 
 
 async def my_likes(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -340,6 +423,35 @@ async def my_valentines(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = cur.fetchall()
     text = "\n".join([f"{n} — @{u or 'скрыт'}" for n, u in rows]) if rows else "Пусто"
     await update.message.reply_text("💌 Валентинки:\n" + text)
+
+
+async def back_anketa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_premium(update.effective_user.id):
+        await update.message.reply_text("Возврат анкеты доступен только с ⭐ Premium")
+        return
+    user_id = update.effective_user.id
+    cur.execute("SELECT last_shown FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        await update.message.reply_text("Нет анкеты для возврата")
+        return
+    last_id = row[0]
+    cur.execute("SELECT user_id, name, age, about, photos, my_gender FROM users WHERE user_id = ?", (last_id,))
+    r = cur.fetchone()
+    if not r:
+        await update.message.reply_text("Анкета недоступна")
+        return
+    uid, name, age, about, photos, gender = r
+    text = f"👤 {name}, {age} ({gender})\n\n{about or '—'}"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{uid}")],
+        [InlineKeyboardButton("⭐ Супер-лайк", callback_data=f"super_{uid}")]
+    ])
+    photos_list = photos.split(",") if photos else []
+    if photos_list:
+        await update.message.reply_photo(photos_list[0], caption=text, reply_markup=kb)
+    else:
+        await update.message.reply_text(text, reply_markup=kb)
 
 
 async def verify_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -386,7 +498,7 @@ async def verify_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Заявка на верификацию от {uid}\nКод: {code}\nЗадание: {task}\n\n"
                 f"/approve {uid}\n/reject {uid}"
             )
-        except Exception as e:
+        except:
             await update.message.reply_text("Ошибка отправки модератору.")
             return ConversationHandler.END
     await update.message.reply_text("Заявка отправлена ✅ Ожидай проверки.", reply_markup=main_menu())
@@ -423,19 +535,48 @@ async def reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
     attempts = row[0] if row else 0
     await update.message.reply_text(f"❌ {uid} отклонён ({attempts}/{MAX_VERIFY_ATTEMPTS})")
     try:
-        await context.bot.send_message(uid, f"❌ Верификация не пройдена. Попыток использовано: {attempts}/{MAX_VERIFY_ATTEMPTS}")
+        await context.bot.send_message(uid, f"❌ Верификация не пройдена. Попыток: {attempts}/{MAX_VERIFY_ATTEMPTS}")
     except:
         pass
 
 
 async def premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_invoice(
-        title="Доступ на 3 дня",
-        description="Premium доступ",
+    if is_premium(update.effective_user.id):
+        if update.effective_user.id == ADMIN_ID:
+            await update.message.reply_text("⭐ У тебя Premium навсегда (создатель)")
+            return
+        cur.execute("SELECT premium_until FROM users WHERE user_id = ?", (update.effective_user.id,))
+        until = cur.fetchone()[0]
+        await update.message.reply_text(f"⭐ Premium активен до {until}")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⭐ Купить Premium (20 звёзд)", callback_data="buy_premium")]
+    ])
+    await update.message.reply_text(
+        "⭐ Premium на 3 дня — 20 звёзд\n\n"
+        "Что даёт:\n"
+        "• Супер-лайк (5/день)\n"
+        "• Безлимитные лайки\n"
+        "• До 6 фото\n"
+        "• Значок ⭐ в анкете\n"
+        "• Возврат анкеты\n"
+        "• Приоритет в поиске\n"
+        "• Скрыть онлайн",
+        reply_markup=kb
+    )
+
+
+async def buy_premium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await context.bot.send_invoice(
+        chat_id=q.from_user.id,
+        title="Premium на 3 дня",
+        description="Супер-лайки, безлимит, до 6 фото и другие плюшки",
         payload="premium_3d",
         provider_token="",
         currency="XTR",
-        prices=[LabeledPrice("3 дня", 50)]
+        prices=[LabeledPrice("Premium 3 дня", 20)]
     )
 
 
@@ -485,11 +626,14 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^💗 Лайки$"), my_likes))
     app.add_handler(MessageHandler(filters.Regex("^💖 Мэтчи$"), my_matches))
     app.add_handler(MessageHandler(filters.Regex("^💌 Валентинки$"), my_valentines))
+    app.add_handler(MessageHandler(filters.Regex("^👁 Кто лайкнул$"), who_liked))
     app.add_handler(MessageHandler(filters.Regex("^✏️ Моя анкета$"), my_profile))
-    app.add_handler(MessageHandler(filters.Regex("^✅ Верификация$"), verify_start))
     app.add_handler(MessageHandler(filters.Regex("^⭐ Premium$"), premium))
+    app.add_handler(MessageHandler(filters.Regex("^✅ Верификация$"), verify_start))
+    app.add_handler(MessageHandler(filters.Regex("^↩️ Вернуть анкету$"), back_anketa))
     app.add_handler(MessageHandler(filters.Regex("^🗑 Удалить анкету$"), delete_profile))
     app.add_handler(CallbackQueryHandler(like_handler))
+    app.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_premium$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
     app.run_polling()
