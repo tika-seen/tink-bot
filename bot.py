@@ -16,8 +16,9 @@ TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 CHANNEL = "@niwzex"
 MAX_VERIFY_ATTEMPTS = 15
+MAX_BDAY_CHANGES = 5
 
-NAME, AGE, MY_GENDER, ABOUT, CITY_OR_GEO, RADIUS, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(9)
+NAME, AGE, MY_GENDER, ABOUT, BDAY, CITY_OR_GEO, RADIUS, PHOTO, PARTNER_GENDER, PARTNER_AGE = range(10)
 VERIFY_VIDEO = 100
 EDIT_VALUE = 300
 
@@ -27,6 +28,7 @@ cur = conn.cursor()
 cur.execute("""CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
     username TEXT, name TEXT, age INTEGER, my_gender TEXT, about TEXT,
+    birthday TEXT DEFAULT '', bday_changes INTEGER DEFAULT 0, bday_gift_year INTEGER DEFAULT 0,
     city TEXT, lat REAL, lon REAL, radius INTEGER DEFAULT 50,
     photos TEXT, partner_gender TEXT, partner_age_min INTEGER, partner_age_max INTEGER,
     verified INTEGER DEFAULT 0, premium_until TEXT,
@@ -41,6 +43,9 @@ cur.execute("""CREATE TABLE IF NOT EXISTS likes (
 )""")
 cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     from_id INTEGER, to_id INTEGER, reason TEXT, date TEXT
+)""")
+cur.execute("""CREATE TABLE IF NOT EXISTS anon (
+    from_id INTEGER, to_id INTEGER, text TEXT, date TEXT
 )""")
 conn.commit()
 
@@ -167,21 +172,7 @@ async def start(update, context):
     args = context.args
     cur.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
     if cur.fetchone():
-        if args and args[0].startswith("ref"):
-            try:
-                inviter = int(args[0].replace("ref", ""))
-                if inviter != user_id:
-                    cur.execute("SELECT invited_by FROM users WHERE user_id = ?", (user_id,))
-                    if cur.fetchone()[0] == 0:
-                        cur.execute("UPDATE users SET invited_by = ? WHERE user_id = ?", (inviter, user_id))
-                        cur.execute("UPDATE users SET invites = invites + 1, bonus_likes = bonus_likes + 50 WHERE user_id = ?", (inviter,))
-                        conn.commit()
-                        try:
-                            await context.bot.send_message(inviter, "🎉 По твоей ссылке пришёл друг! +50 лайков навсегда.")
-                        except:
-                            pass
-            except:
-                pass
+        check_birthday(update.effective_user.id)
         cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (today(), user_id))
         conn.commit()
         await update.message.reply_text("Ты уже зарегистрирован(а) 💕", reply_markup=main_menu())
@@ -189,6 +180,26 @@ async def start(update, context):
     context.user_data["ref"] = args[0] if args else None
     await update.message.reply_text("Привет! Давай создадим анкету 💕\n\nКак тебя зовут?")
     return NAME
+
+
+def check_birthday(user_id):
+    cur.execute("SELECT birthday, bday_gift_year FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return False
+    bday, gift_year = row
+    try:
+        d, m = bday.split(".")
+        now = datetime.date.today()
+        if int(d) == now.day and int(m) == now.month and gift_year != now.year:
+            until = (now + datetime.timedelta(hours=12)).isoformat()
+            cur.execute("UPDATE users SET premium_until = ?, bday_gift_year = ? WHERE user_id = ?",
+                        (until, now.year, user_id))
+            conn.commit()
+            return True
+    except:
+        pass
+    return False
 
 
 async def get_name(update, context):
@@ -223,14 +234,30 @@ async def get_my_gender(update, context):
 
 async def get_about(update, context):
     context.user_data["about"] = "" if update.message.text == "Пропустить" else update.message.text
+    await update.message.reply_text("Напиши свой день рождения в формате ДД.ММ (например: 05.04)\n\nИли нажми «Пропустить»",
+        reply_markup=ReplyKeyboardMarkup([["Пропустить"]], resize_keyboard=True))
+    return BDAY
+
+
+async def get_bday(update, context):
+    if update.message.text == "Пропустить":
+        context.user_data["birthday"] = ""
+    else:
+        t = update.message.text.strip()
+        try:
+            d, m = t.split(".")
+            di, mi = int(d), int(m)
+            if di < 1 or di > 31 or mi < 1 or mi > 12:
+                raise ValueError
+            context.user_data["birthday"] = f"{di:02d}.{mi:02d}"
+        except:
+            await update.message.reply_text("Формат ДД.ММ (например: 05.04). Попробуй ещё или нажми «Пропустить»")
+            return BDAY
     kb = ReplyKeyboardMarkup(
         [[KeyboardButton("📍 Отправить гео", request_location=True)]],
         resize_keyboard=True, one_time_keyboard=True
     )
-    await update.message.reply_text(
-        "Напиши свой город **или** отправь гео 📍\n\n(Если отправишь гео — город можно не писать)",
-        reply_markup=kb, parse_mode="Markdown"
-    )
+    await update.message.reply_text("Напиши свой город **или** отправь гео 📍", reply_markup=kb, parse_mode="Markdown")
     return CITY_OR_GEO
 
 
@@ -318,13 +345,14 @@ async def get_partner_age(update, context):
         except:
             inviter = 0
     cur.execute("""INSERT OR REPLACE INTO users
-        (user_id, username, name, age, my_gender, about, city, lat, lon, radius,
-         photos, partner_gender, partner_age_min, partner_age_max, verified,
+        (user_id, username, name, age, my_gender, about, birthday, bday_changes, bday_gift_year,
+         city, lat, lon, radius, photos, partner_gender, partner_age_min, partner_age_max, verified,
          premium_until, likes_today, likes_date, verify_attempts, super_likes_today,
          last_shown, hidden, last_active, bonus_date, invited_by, invites, bonus_likes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
         user.id, user.username or "", context.user_data["name"], context.user_data["age"],
         context.user_data["my_gender"], context.user_data["about"],
+        context.user_data.get("birthday", ""), 0, 0,
         context.user_data["city"], context.user_data.get("lat"), context.user_data.get("lon"),
         context.user_data["radius"],
         ",".join(context.user_data["photos"]),
@@ -346,6 +374,8 @@ async def get_partner_age(update, context):
 # ---------- Поиск ----------
 async def find(update, context):
     user_id = update.effective_user.id
+    if check_birthday(user_id):
+        await update.message.reply_text("🎂 С днём рождения! Дарю тебе Premium на 12 часов ⭐")
     cur.execute("UPDATE users SET last_active = ? WHERE user_id = ?", (today(), user_id))
     conn.commit()
     if not check_like_limit(user_id):
@@ -354,7 +384,7 @@ async def find(update, context):
     cur.execute("SELECT city, lat, lon, radius FROM users WHERE user_id = ?", (user_id,))
     me = cur.fetchone()
     my_city, my_lat, my_lon, my_radius = me if me else (None, None, None, 50)
-    cur.execute("""SELECT user_id, name, age, about, photos, my_gender, city, lat, lon, verified
+    cur.execute("""SELECT user_id, name, age, about, photos, my_gender, city, lat, lon, verified, birthday
                    FROM users WHERE user_id != ? AND user_id != ?
                    AND user_id NOT IN (SELECT to_id FROM likes WHERE from_id = ?)""",
                 (user_id, ADMIN_ID, user_id))
@@ -363,8 +393,9 @@ async def find(update, context):
         await update.message.reply_text("Анкеты закончились 😔")
         return
     candidates = []
+    now = datetime.date.today()
     for r in rows:
-        uid, name, age, about, photos, gender, city, lat, lon, ver = r
+        uid, name, age, about, photos, gender, city, lat, lon, ver, bday = r
         dist = None
         match = False
         if my_lat and my_lon and lat and lon:
@@ -374,12 +405,21 @@ async def find(update, context):
         elif my_city and city and my_city == city:
             match = True
         if match:
-            candidates.append((dist if dist is not None else 9999, uid, name, age, about, photos, gender, city, dist, ver))
+            is_bday_today = False
+            if bday:
+                try:
+                    d, m = bday.split(".")
+                    if int(d) == now.day and int(m) == now.month:
+                        is_bday_today = True
+                except:
+                    pass
+            candidates.append((0 if is_bday_today else 1, dist if dist is not None else 9999,
+                               uid, name, age, about, photos, gender, city, dist, ver, is_bday_today))
     if not candidates:
         await update.message.reply_text("В твоём городе/радиусе пока никого нет 😔")
         return
-    candidates.sort(key=lambda x: x[0])
-    dist, uid, name, age, about, photos, gender, city, real_dist, ver = candidates[0]
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    _, _, uid, name, age, about, photos, gender, city, real_dist, ver, is_bday_today = candidates[0]
     cur.execute("UPDATE users SET last_shown = ? WHERE user_id = ?", (uid, user_id))
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM likes WHERE to_id = ?", (uid,))
@@ -387,27 +427,29 @@ async def find(update, context):
     cur.execute("SELECT last_active FROM users WHERE user_id = ?", (uid,))
     la = cur.fetchone()
     newbie = ""
-    if la and la[0]:
-        d = days_since(la[0])
-        if d <= 3:
-            newbie = " 🆕"
+    if la and la[0] and days_since(la[0]) <= 3:
+        newbie = " 🆕"
     badges = ""
     if ver:
         badges += " ✅"
     if is_premium(uid):
         badges += " ⭐"
+    if is_bday_today:
+        badges += " 🎂"
     if real_dist is not None:
         dist_text = f"\n📍 {round(real_dist, 1)} км"
     elif city:
         dist_text = f"\n🏙 {city}"
     else:
         dist_text = ""
-    text = (f"👤 {name}, {age} ({gender}){badges}{newbie}{dist_text}\n"
+    bday_note = "\n🎂 Сегодня ДР!" if is_bday_today else ""
+    text = (f"👤 {name}, {age} ({gender}){badges}{newbie}{dist_text}{bday_note}\n"
             f"❤️ {likes_count} лайков\n\n{about or '—'}")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("❤️ Лайк", callback_data=f"like_{uid}"),
          InlineKeyboardButton("💌 Валентинка", callback_data=f"val_{uid}")],
         [InlineKeyboardButton("⭐ Супер-лайк", callback_data=f"super_{uid}")],
+        [InlineKeyboardButton("💬 Анонимка", callback_data=f"anon_{uid}")],
         [InlineKeyboardButton("👎 Пропустить", callback_data="skip"),
          InlineKeyboardButton("🚨 Жалоба", callback_data=f"report_{uid}")]
     ])
@@ -457,6 +499,12 @@ async def like_handler(update, context):
                 pass
         return
 
+    if data.startswith("anon_"):
+        target = int(data.split("_")[1])
+        context.user_data["anon_to"] = target
+        await context.bot.send_message(me, "💬 Напиши анонимное сообщение — оно уйдёт тому, кого ты лайкнул(а):")
+        return
+
     if data.startswith("super_"):
         if not check_super_limit(me):
             await q.answer("Супер-лайк доступен только с Premium (5/день)", show_alert=True)
@@ -503,16 +551,34 @@ async def like_handler(update, context):
                 pass
 
 
-# ---------- Моя анкета (инлайн) ----------
+async def anon_message(update, context):
+    target = context.user_data.get("anon_to")
+    if not target:
+        return
+    cur.execute("INSERT INTO anon VALUES (?, ?, ?, ?)",
+                (update.effective_user.id, target, update.message.text, today()))
+    conn.commit()
+    context.user_data["anon_to"] = None
+    await update.message.reply_text("💬 Анонимка отправлена!")
+    try:
+        await context.bot.send_message(target,
+            f"💬 Тебе анонимное сообщение:\n\n{update.message.text}")
+    except:
+        pass
+
+
+# ---------- Профиль и редактирование ----------
 async def my_profile(update, context):
     user_id = update.effective_user.id
-    cur.execute("""SELECT name, age, my_gender, about, photos, verified, city, radius, lat, lon
+    if check_birthday(user_id):
+        await update.message.reply_text("🎂 С днём рождения! Дарю тебе Premium на 12 часов ⭐")
+    cur.execute("""SELECT name, age, my_gender, about, photos, verified, city, radius, lat, lon, birthday
                    FROM users WHERE user_id = ?""", (user_id,))
     row = cur.fetchone()
     if not row:
         await update.message.reply_text("Анкеты нет. /start")
         return
-    name, age, gender, about, photos, verified, city, radius, lat, lon = row
+    name, age, gender, about, photos, verified, city, radius, lat, lon, bday = row
     cur.execute("SELECT COUNT(*) FROM likes WHERE to_id = ?", (user_id,))
     likes_count = cur.fetchone()[0]
     cur.execute("SELECT invites FROM users WHERE user_id = ?", (user_id,))
@@ -523,8 +589,9 @@ async def my_profile(update, context):
     if is_premium(user_id):
         status.append("⭐")
     loc = "📍 по гео" if (lat and lon) else (f"🏙 {city}" if city else "")
+    bday_line = f"🎂 {bday}\n" if bday else ""
     text = (f"👤 {name}, {age} ({gender}) {' '.join(status)}\n"
-            f"{loc} · 📏 {radius} км\n"
+            f"{bday_line}{loc} · 📏 {radius} км\n"
             f"❤️ {likes_count} лайков · 👥 {invites} друзей\n\n{about or '—'}")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_menu")],
@@ -550,11 +617,16 @@ async def profile_callback(update, context):
     user_id = q.from_user.id
 
     if data == "edit_menu":
+        cur.execute("SELECT bday_changes FROM users WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        changes = r[0] if r else 0
+        bday_btn = f"🎂 ДР ({changes}/{MAX_BDAY_CHANGES})" if changes < MAX_BDAY_CHANGES else "🎂 ДР (лимит)"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Имя", callback_data="edit_name"),
              InlineKeyboardButton("Возраст", callback_data="edit_age")],
             [InlineKeyboardButton("Описание", callback_data="edit_about"),
              InlineKeyboardButton("Фото", callback_data="edit_photo")],
+            [InlineKeyboardButton(bday_btn, callback_data="edit_bday")],
             [InlineKeyboardButton("🏙 Город / Гео", callback_data="edit_city")],
             [InlineKeyboardButton("Радиус", callback_data="edit_radius"),
              InlineKeyboardButton("Пол", callback_data="edit_gender")],
@@ -621,6 +693,16 @@ async def profile_callback(update, context):
             await context.bot.send_message(user_id, text, reply_markup=kb)
         return
 
+    if data == "edit_bday":
+        cur.execute("SELECT bday_changes FROM users WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        if r and r[0] >= MAX_BDAY_CHANGES:
+            await context.bot.send_message(user_id, "🎂 Лимит изменений ДР исчерпан (5/5)")
+            return
+        context.user_data["edit_field"] = "bday"
+        await context.bot.send_message(user_id, "🎂 Напиши новую дату ДР в формате ДД.ММ:")
+        return
+
     if data.startswith("edit_"):
         field = data.replace("edit_", "")
         context.user_data["edit_field"] = field
@@ -651,6 +733,42 @@ async def profile_callback(update, context):
         else:
             await context.bot.send_message(user_id, prompts[field])
         return
+
+
+async def start_edit(update, context):
+    q = update.callback_query
+    await q.answer()
+    field = q.data.replace("edit_", "")
+    user_id = q.from_user.id
+    context.user_data["edit_field"] = field
+    prompts = {
+        "name": "Новое имя:",
+        "age": "Новый возраст (15–99):",
+        "about": "Новое описание:",
+        "photo": "Отправь новые фото:",
+        "city": "Напиши город или отправь гео 📍",
+        "radius": "Новый радиус (5–100):",
+        "gender": "Новый пол:",
+        "bday": "Напиши новую дату ДР в формате ДД.ММ:"
+    }
+    if field == "city":
+        kb = ReplyKeyboardMarkup(
+            [[KeyboardButton("📍 Отправить гео", request_location=True)], ["🔙 В меню"]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await context.bot.send_message(user_id, prompts["city"], reply_markup=kb)
+    elif field == "radius":
+        await context.bot.send_message(user_id, prompts["radius"],
+            reply_markup=ReplyKeyboardMarkup([["5", "10", "25"], ["50", "75", "100"]], resize_keyboard=True))
+    elif field == "gender":
+        await context.bot.send_message(user_id, prompts["gender"],
+            reply_markup=ReplyKeyboardMarkup([["М", "Ж"]], resize_keyboard=True))
+    elif field == "photo":
+        context.user_data["edit_photos"] = []
+        await context.bot.send_message(user_id, prompts["photo"])
+    else:
+        await context.bot.send_message(user_id, prompts[field])
+    return EDIT_VALUE
 
 
 async def edit_value(update, context):
@@ -707,6 +825,27 @@ async def edit_value(update, context):
         cur.execute("UPDATE users SET my_gender = ? WHERE user_id = ?", (g, user_id))
         conn.commit()
         await update.message.reply_text("✅ Пол изменён", reply_markup=main_menu())
+    elif field == "bday":
+        cur.execute("SELECT bday_changes FROM users WHERE user_id = ?", (user_id,))
+        r = cur.fetchone()
+        changes = r[0] if r else 0
+        if changes >= MAX_BDAY_CHANGES:
+            await update.message.reply_text("Лимит изменений ДР исчерпан", reply_markup=main_menu())
+            context.user_data["edit_field"] = None
+            return ConversationHandler.END
+        try:
+            d, m = update.message.text.strip().split(".")
+            di, mi = int(d), int(m)
+            if di < 1 or di > 31 or mi < 1 or mi > 12:
+                raise ValueError
+            bday = f"{di:02d}.{mi:02d}"
+        except:
+            await update.message.reply_text("Формат ДД.ММ")
+            return EDIT_VALUE
+        cur.execute("UPDATE users SET birthday = ?, bday_changes = bday_changes + 1 WHERE user_id = ?",
+                    (bday, user_id))
+        conn.commit()
+        await update.message.reply_text(f"✅ ДР изменён ({changes+1}/{MAX_BDAY_CHANGES})", reply_markup=main_menu())
     elif field == "photo":
         photos = context.user_data.get("edit_photos", [])
         limit = get_photo_limit(user_id)
@@ -726,13 +865,11 @@ async def edit_value(update, context):
             await update.message.reply_text(f"({len(photos)}/{limit}) Ещё или Готово?",
                 reply_markup=ReplyKeyboardMarkup([["Добавить ещё", "Готово"]], resize_keyboard=True))
             return EDIT_VALUE
-        context.user_data["edit_field"] = None
-        return ConversationHandler.END
     context.user_data["edit_field"] = None
     return ConversationHandler.END
 
 
-# ---------- Бонус ----------
+# ---------- Бонусы и прочее ----------
 async def bonus(update, context):
     user_id = update.effective_user.id
     cur.execute("SELECT bonus_date FROM users WHERE user_id = ?", (user_id,))
@@ -748,7 +885,6 @@ async def bonus(update, context):
     await update.message.reply_text("🎁 +10 лайков на сегодня!")
 
 
-# ---------- Пригласи друга ----------
 async def invite(update, context):
     user_id = update.effective_user.id
     bot_username = (await context.bot.get_me()).username
@@ -764,7 +900,6 @@ async def invite(update, context):
     )
 
 
-# ---------- Моя статистика ----------
 async def my_stats(update, context):
     user_id = update.effective_user.id
     cur.execute("SELECT COUNT(*) FROM likes WHERE from_id = ?", (user_id,))
@@ -821,7 +956,7 @@ async def verify_start(update, context):
 
 async def verify_video(update, context):
     if not update.message.video_note:
-        await update.message.reply_text("Нужен видео-кружок")
+        await update.message.reply_text("Нужен именно видео-кружок 📹")
         return VERIFY_VIDEO
     uid = update.effective_user.id
     code = context.user_data.get("verify_code", "????")
@@ -830,12 +965,24 @@ async def verify_video(update, context):
     conn.commit()
     if ADMIN_ID:
         try:
-            await context.bot.send_video_note(ADMIN_ID, update.message.video_note.file_id)
-            await context.bot.send_message(ADMIN_ID,
-                f"Заявка от {uid}\nКод: {code}\nЗадание: {task}\n\n/approve {uid}\n/reject {uid}")
-        except:
-            pass
-    await update.message.reply_text("Заявка отправлена ✅", reply_markup=main_menu())
+            cur.execute("SELECT name, age, my_gender, about, photos, city FROM users WHERE user_id = ?", (uid,))
+            r = cur.fetchone()
+            if r:
+                name, age, gender, about, photos, city = r
+                info = (f"👤 {name}, {age} ({gender})\n🏙 {city or 'гео'}\n\n{about or '—'}\n\n"
+                        f"Код: {code}\nЗадание: {task}\n\n/approve {uid}\n/reject {uid}")
+                photos_list = photos.split(",") if photos else []
+                if photos_list:
+                    await context.bot.send_photo(ADMIN_ID, photos_list[0], caption=info)
+                else:
+                    await context.bot.send_message(ADMIN_ID, info)
+                await context.bot.send_video_note(ADMIN_ID, update.message.video_note.file_id)
+        except Exception as e:
+            print("verify error:", e)
+    await update.message.reply_text(
+        "⏳ Заявка отправлена на проверку\n\n"
+        "Ожидай от 1 до 24 часов. Модератор проверит твой кружок и пришлёт ответ 💕",
+        reply_markup=main_menu())
     return ConversationHandler.END
 
 
@@ -851,7 +998,9 @@ async def approve(update, context):
     conn.commit()
     await update.message.reply_text(f"✅ {uid} верифицирован")
     try:
-        await context.bot.send_message(uid, "✅ Верификация пройдена!")
+        await context.bot.send_message(uid,
+            "🎉 Поздравляем! Ты прошёл верификацию ✅\n\n"
+            "Теперь тебе доступно 500 лайков в день и значок ✅ в анкете.")
     except:
         pass
 
@@ -869,7 +1018,9 @@ async def reject(update, context):
     attempts = row[0] if row else 0
     await update.message.reply_text(f"❌ {uid} отклонён ({attempts}/{MAX_VERIFY_ATTEMPTS})")
     try:
-        await context.bot.send_message(uid, f"❌ Верификация не пройдена ({attempts}/{MAX_VERIFY_ATTEMPTS})")
+        await context.bot.send_message(uid,
+            f"😔 Верификация не пройдена.\n\nПопыток использовано: {attempts} из {MAX_VERIFY_ATTEMPTS}.\n"
+            f"Попробуй снова — нажми «✅ Верификация».")
     except:
         pass
 
@@ -994,6 +1145,7 @@ def main():
             AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_age)],
             MY_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_my_gender)],
             ABOUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_about)],
+            BDAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_bday)],
             CITY_OR_GEO: [
                 MessageHandler(filters.LOCATION, get_city_or_geo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, get_city_or_geo)
@@ -1004,11 +1156,18 @@ def main():
             PARTNER_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_partner_gender)],
             PARTNER_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_partner_age)],
             VERIFY_VIDEO: [MessageHandler(filters.VIDEO_NOTE, verify_video)],
-            EDIT_VALUE: [MessageHandler(filters.ALL & ~filters.COMMAND, edit_value)],
         },
         fallbacks=[]
     )
     app.add_handler(conv)
+
+    edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(start_edit, pattern="^edit_(name|age|about|photo|city|radius|gender|bday)$")],
+        states={EDIT_VALUE: [MessageHandler(filters.ALL & ~filters.COMMAND, edit_value)]},
+        fallbacks=[]
+    )
+    app.add_handler(edit_conv)
+
     app.add_handler(CommandHandler("approve", approve))
     app.add_handler(CommandHandler("reject", reject))
     app.add_handler(CommandHandler("stats", stats))
@@ -1024,7 +1183,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^⭐ Premium$"), premium))
     app.add_handler(MessageHandler(filters.Regex("^✅ Верификация$"), verify_start))
     app.add_handler(MessageHandler(filters.Regex("^🗑 Удалить анкету$"), delete_profile))
-    app.add_handler(CallbackQueryHandler(profile_callback, pattern="^(edit_|profile_back|who_liked|my_valentines|back_anketa)"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, anon_message))
+    app.add_handler(CallbackQueryHandler(profile_callback, pattern="^(edit_menu|profile_back|who_liked|my_valentines|back_anketa)$"))
     app.add_handler(CallbackQueryHandler(like_handler))
     app.add_handler(CallbackQueryHandler(buy_premium, pattern="^buy_premium$"))
     app.add_handler(PreCheckoutQueryHandler(precheckout))
