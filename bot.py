@@ -32,6 +32,7 @@ ROULETTE_CHAT = 700
 
 conn = sqlite3.connect("dating.db", check_same_thread=False)
 cur = conn.cursor()
+
 cur.execute("CREATE INDEX IF NOT EXISTS idx_city ON users(city)")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_hidden ON users(hidden)")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_user ON users(user_id)")
