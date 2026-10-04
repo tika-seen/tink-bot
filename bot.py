@@ -28,15 +28,9 @@ VERIFY_VIDEO = 100
 EDIT_NAME, EDIT_AGE, EDIT_ABOUT, EDIT_PHOTO, EDIT_CITY, EDIT_RADIUS, EDIT_GENDER = range(200, 207)
 EDIT_SONG = 500
 ANON_VAL = 600
-ROULETTE_CHAT = 700
 
 conn = sqlite3.connect("dating.db", check_same_thread=False)
 cur = conn.cursor()
-
-cur.execute("CREATE INDEX IF NOT EXISTS idx_city ON users(city)")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_hidden ON users(hidden)")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_user ON users(user_id)")
-conn.commit()
 
 cur.execute("""CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -60,6 +54,12 @@ cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     from_id INTEGER, to_id INTEGER, reason TEXT, date TEXT
 )""")
 conn.commit()
+try:
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_city ON users(city)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_hidden ON users(hidden)")
+    conn.commit()
+except:
+    pass
 
 
 def today():
@@ -92,8 +92,8 @@ def geocode_city(city_name):
             data = json.loads(resp.read().decode())
             if data:
                 return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception as e:
-        print("geocode error:", e)
+    except:
+        pass
     return None, None
 
 
@@ -839,7 +839,7 @@ async def roulette_start(update, context):
     cur.execute("SELECT roulette_partner FROM users WHERE user_id = ?", (user_id,))
     r = cur.fetchone()
     if r and r[0]:
-        await update.message.reply_text("🎤 Ты уже в рулетке. Пиши голосовые — бот перешлёт.\n/roulette_stop — выйти.")
+        await update.message.reply_text("🎤 Ты уже в рулетке. Пиши голосовые.\n/roulette_stop — выйти.")
         return
     cur.execute("""SELECT user_id FROM users WHERE roulette_partner = 0
                    AND user_id != ? AND user_id != ? AND hidden = 0 LIMIT 1""",
@@ -852,7 +852,7 @@ async def roulette_start(update, context):
     cur.execute("UPDATE users SET roulette_partner = ? WHERE user_id = ?", (partner, user_id))
     cur.execute("UPDATE users SET roulette_partner = ? WHERE user_id = ?", (user_id, partner))
     conn.commit()
-    await update.message.reply_text("🎤 Ты в рулетке! Пиши голосовые — бот перешлёт.\n/roulette_stop — выйти.")
+    await update.message.reply_text("🎤 Ты в рулетке! Пиши голосовые.\n/roulette_stop — выйти.")
     try:
         await context.bot.send_message(partner, "🎤 Ты в рулетке! Пиши голосовые.")
     except:
@@ -869,10 +869,10 @@ async def roulette_stop(update, context):
         cur.execute("UPDATE users SET roulette_partner = 0 WHERE user_id = ?", (partner,))
         conn.commit()
         try:
-            await context.bot.send_message(partner, "🎤 Собеседник вышел из рулетки.")
+            await context.bot.send_message(partner, "🎤 Собеседник вышел.")
         except:
             pass
-    await update.message.reply_text("🎤 Ты вышел из рулетки.", reply_markup=main_menu())
+    await update.message.reply_text("🎤 Ты вышел.", reply_markup=main_menu())
 
 
 async def roulette_forward(update, context):
@@ -913,9 +913,8 @@ async def premium(update, context):
         [InlineKeyboardButton(f"💎 Купить за {PREMIUM_FOR_PLUSHKI} плюшек", callback_data="buy_plushki")]
     ])
     await update.message.reply_text(
-        f"⭐ Premium\n\n• Кто лайкнул — бесплатно\n• Безлимит лайков\n• До 6 фото\n"
-        f"• Значок ⭐\n• Возврат анкеты\n• Приоритет в поиске\n\n💎 У тебя: {pl} плюшек",
-        reply_markup=kb)
+        f"⭐ Premium\n\n• Безлимит лайков\n• До 6 фото\n• Значок ⭐\n"
+        f"• Приоритет в поиске\n\n💎 У тебя: {pl} плюшек", reply_markup=kb)
 
 
 async def buy_premium_callback(update, context):
@@ -1011,8 +1010,7 @@ async def verify_video(update, context):
         except Exception as e:
             print("verify error:", e)
     await update.message.reply_text(
-        "⏳ Заявка отправлена на проверку\n\nОжидай от 1 до 24 часов. Модератор проверит твой кружок 💕",
-        reply_markup=main_menu())
+        "⏳ Заявка отправлена на проверку\n\nОжидай от 1 до 24 часов 💕", reply_markup=main_menu())
     return ConversationHandler.END
 
 
@@ -1028,7 +1026,7 @@ async def approve(update, context):
     conn.commit()
     await update.message.reply_text(f"✅ {uid} верифицирован")
     try:
-        await context.bot.send_message(uid, "🎉 Поздравляем! Ты прошёл верификацию ✅\n\nТеперь 500 лайков в день и значок ✅.")
+        await context.bot.send_message(uid, "🎉 Верификация пройдена ✅ Теперь 500 лайков в день.")
     except:
         pass
 
@@ -1046,7 +1044,7 @@ async def reject(update, context):
     attempts = row[0] if row else 0
     await update.message.reply_text(f"❌ {uid} отклонён ({attempts}/{MAX_VERIFY_ATTEMPTS})")
     try:
-        await context.bot.send_message(uid, f"😔 Верификация не пройдена.\n\nПопыток: {attempts} из {MAX_VERIFY_ATTEMPTS}.\nПопробуй снова — «✅ Верификация».")
+        await context.bot.send_message(uid, f"😔 Не пройдено. Попыток: {attempts}/{MAX_VERIFY_ATTEMPTS}.")
     except:
         pass
 
@@ -1058,12 +1056,11 @@ async def stats(update, context):
     cur.execute("SELECT COUNT(*) FROM users WHERE verified = 1"); ver = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM users WHERE premium_until IS NOT NULL AND premium_until >= ?", (today(),)); prem = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM likes"); likes = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(*) FROM likes WHERE valentine = 1"); vals = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM reports"); reps = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM users WHERE last_active = ?", (today(),)); active = cur.fetchone()[0]
     await update.message.reply_text(
         f"📊 Тинк\n\n👥 Всего: {total}\n✅ Вериф: {ver}\n⭐ Premium: {prem}\n🟢 Активных: {active}\n\n"
-        f"❤️ {likes} · 💌 {vals} · 🚨 {reps}")
+        f"❤️ {likes} · 🚨 {reps}")
 
 
 async def grant_premium(update, context):
@@ -1151,8 +1148,7 @@ def main():
         entry_points=[MessageHandler(filters.Regex("^✏️ Редактировать$"), edit_start)],
         states={
             EDIT_NAME: [
-                MessageHandler(filters.Regex("^Имя$"), lambda u, c: u.message.reply_text("Новое имя:")),
-                MessageHandler(filters.Regex("^Возраст$"), lambda u, c: u.message.reply_text("Новый возраст:")),
+                MessageHandler(filters.Regex("^Возраст$"), lambda u, c: (u.message.reply_text("Новый возраст:"), 1)[1] and EDIT_AGE),
                 MessageHandler(filters.Regex("^Описание$"), lambda u, c: u.message.reply_text("Новое описание:")),
                 MessageHandler(filters.Regex("^Фото$"), lambda u, c: u.message.reply_text("Отправь фото:")),
                 MessageHandler(filters.Regex("^🏙 Город / Гео$"), lambda u, c: u.message.reply_text("Город или гео:")),
